@@ -707,7 +707,7 @@ namespace OpenLiveWriter.BlogClient.Providers
         private bool _supportsSpacesCIDUrls = false;
         private string _postDateFormat = String.Empty;
         private string _fileUploadFormat = String.Empty;
-        private bool _useLocalTime = false;
+        private bool _useLocalTime = true;
         private string _characterSet = String.Empty;
         private bool _requiresXHTML = false;
         private string _contentFilter = String.Empty;
