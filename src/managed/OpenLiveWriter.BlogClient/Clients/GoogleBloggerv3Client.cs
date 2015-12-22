@@ -35,6 +35,7 @@ namespace OpenLiveWriter.BlogClient.Clients
         // These URLs map to OAuth2 permission scopes for Google Blogger.
         public static string PicasaServiceScope = "https://picasaweb.google.com/data";
         public static string BloggerServiceScope = BloggerService.Scope.Blogger;
+        public static char LabelDelimiter = ',';
 
         public static Task<UserCredential> GetOAuth2AuthorizationAsync(string blogId, CancellationToken taskCancellationToken)
         {
@@ -74,8 +75,7 @@ namespace OpenLiveWriter.BlogClient.Clients
                 Permalink = page.Url,
                 Contents = page.Content,
                 DatePublished = page.Published.Value,
-                // TODO:OLW - Need to figure out how to make the UI for 'tags' show up in Writer
-                // Keywords = string.Join(",", p.Labels)
+                //Keywords = string.Join(LabelDelimiter, page.Labels)
             };
         }
 
@@ -88,8 +88,7 @@ namespace OpenLiveWriter.BlogClient.Clients
                 Permalink = post.Url,
                 Contents = post.Content,
                 DatePublished = post.Published.Value,
-                // TODO:OLW - Need to figure out how to make the UI for 'tags' show up in Writer
-                // Keywords = string.Join(",", p.Labels)
+                Keywords = string.Join(new string(LabelDelimiter,1), post.Labels ?? new List<string>())
             };
         }
 
@@ -110,7 +109,7 @@ namespace OpenLiveWriter.BlogClient.Clients
             return new Post()
             {
                 Content = post.Contents,
-                Labels = post.Keywords?.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(k => k.Trim()).ToList(),
+                Labels = post.Keywords?.Split(new char[] { LabelDelimiter }, StringSplitOptions.RemoveEmptyEntries).Select(k => k.Trim()).ToList(),
                 // TODO:OLW - DatePublishedOverride didn't work quite right. Either the date published override was off by several hours, 
                 // needs to be normalized to UTC or the Blogger website thinks I'm in the wrong time zone.
                 Published = post.HasDatePublishedOverride ? post?.DatePublishedOverride : null,
@@ -123,6 +122,8 @@ namespace OpenLiveWriter.BlogClient.Clients
             // Google Blogger doesn't support parent/child pages, so we pass string.Empty.
             return new PageInfo(page.Id, page.Title, page.Published.GetValueOrDefault(DateTime.Now), string.Empty);
         }
+
+        private const int MaxRetries = 5;
 
         private const string ENTRY_CONTENT_TYPE = "application/atom+xml;type=entry";
         private const string XHTML_NS = "http://www.w3.org/1999/xhtml";
@@ -149,8 +150,9 @@ namespace OpenLiveWriter.BlogClient.Clients
             clientOptions.SupportsSlug = false;
             clientOptions.SupportsFileUpload = true;
             clientOptions.SupportsKeywords = true;
-            clientOptions.SupportsGetKeywords = false;
+            clientOptions.SupportsGetKeywords = true;
             clientOptions.SupportsPages = true;
+            clientOptions.SupportsExtendedEntries = true;
             _clientOptions = clientOptions;
 
             _nsMgr = new XmlNamespaceManager(new NameTable());
@@ -197,6 +199,7 @@ namespace OpenLiveWriter.BlogClient.Clients
             var transientCredentials = Credentials.TransientCredentials as TransientCredentials ?? 
                 new TransientCredentials(Credentials.Username, Credentials.Password, null);
             VerifyAndRefreshCredentials(transientCredentials);
+            Credentials.TransientCredentials = transientCredentials;
             return transientCredentials;
         }
 
@@ -266,6 +269,14 @@ namespace OpenLiveWriter.BlogClient.Clients
             tc.Token = userCredential;
         }
 
+        private void RefreshAccessToken(TransientCredentials transientCredentials)
+        {
+            // Using the BloggerService automatically refreshes the access token, but we call the Picasa endpoint 
+            // directly and therefore need to force refresh the access token on occasion.
+            var userCredential = transientCredentials.Token as UserCredential;
+            userCredential?.RefreshTokenAsync(CancellationToken.None).Wait();
+        }
+
         private HttpRequestFilter CreateAuthorizationFilter()
         {
             var transientCredentials = Login();
@@ -300,7 +311,7 @@ namespace OpenLiveWriter.BlogClient.Clients
 
         public BlogPostKeyword[] GetKeywords(string blogId)
         {
-            Trace.Fail("Google Blogger does not support GetKeywords!");
+            // Google Blogger does not support get labels
             return new BlogPostKeyword[] { };
         }
 
@@ -672,18 +683,44 @@ namespace OpenLiveWriter.BlogClient.Clients
 
         private void PostNewImage(string albumName, string filename, out string srcUrl, out string editUri)
         {
-            Login();
+            for (int retry = 0; retry < MaxRetries; retry++)
+            {
+                var transientCredentials = Login();
+                try
+                {
+                    string albumUrl = GetBlogImagesAlbum(albumName);
+                    HttpWebResponse response = RedirectHelper.GetResponse(albumUrl, new RedirectHelper.RequestFactory(new UploadFileRequestFactory(this, filename, "POST").Create));
+                    using (Stream s = response.GetResponseStream())
+                    {
+                        ParseMediaEntry(s, out srcUrl, out editUri);
+                        return;
+                    }
+                }
+                catch (WebException we)
+                {
+                    if (retry < MaxRetries - 1 &&
+                        we.Response as HttpWebResponse != null &&
+                        ((HttpWebResponse)we.Response).StatusCode == HttpStatusCode.Forbidden)
+                    {
+                        // HTTP 403 Forbidden means our OAuth access token is not valid.
+                        RefreshAccessToken(transientCredentials);
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+            }
 
-            string albumUrl = GetBlogImagesAlbum(albumName);
-            HttpWebResponse response = RedirectHelper.GetResponse(albumUrl, new RedirectHelper.RequestFactory(new UploadFileRequestFactory(this, filename, "POST").Create));
-            using (Stream s = response.GetResponseStream())
-                ParseMediaEntry(s, out srcUrl, out editUri);
+            Trace.Fail("Should never get here");
+            throw new ApplicationException("Should never get here");
         }
 
         private void UpdateImage(string editUri, string filename, out string srcUrl, out string newEditUri)
         {
-            for (int retry = 5; retry > 0; retry--)
+            for (int retry = 0; retry < MaxRetries; retry++)
             {
+                var transientCredentials = Login();
                 HttpWebResponse response;
                 bool conflict = false;
                 try
@@ -692,20 +729,35 @@ namespace OpenLiveWriter.BlogClient.Clients
                 }
                 catch (WebException we)
                 {
-                    if (retry > 1
-                        && we.Response as HttpWebResponse != null
-                        && ((HttpWebResponse)we.Response).StatusCode == HttpStatusCode.Conflict)
+                    if (retry < MaxRetries - 1 && 
+                        we.Response as HttpWebResponse != null)
                     {
-                        response = (HttpWebResponse)we.Response;
-                        conflict = true;
+                        if (((HttpWebResponse)we.Response).StatusCode == HttpStatusCode.Conflict)
+                        {
+                            response = (HttpWebResponse)we.Response;
+                            conflict = true;
+                        }
+                        else if (((HttpWebResponse)we.Response).StatusCode == HttpStatusCode.Forbidden)
+                        {
+                            // HTTP 403 Forbidden means our OAuth access token is not valid.
+                            RefreshAccessToken(transientCredentials);
+                            continue;
+                        }
                     }
-                    else
-                        throw;
+
+                    throw;
                 }
+
                 using (Stream s = response.GetResponseStream())
+                {
                     ParseMediaEntry(s, out srcUrl, out newEditUri);
+                }
+
                 if (!conflict)
+                {
                     return; // success!
+                }
+
                 editUri = newEditUri;
             }
 
